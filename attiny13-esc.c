@@ -1,5 +1,5 @@
 #ifndef F_CPU
-#define F_CPU 1000000UL 
+#define F_CPU 9600000UL 
 #endif
  
 #include <avr/io.h>
@@ -33,6 +33,9 @@
 // max PWM value to check against in timer1 interrupr
 #define     MAX_PWM_VALUE          255  
 
+// how often to trigger compare match A interrupt
+#define     COMPARE_MATCH_A        0xff
+
 // function for translating input PWM to motor speed PWM
 #define     TRANSLATE_FORWARD_PWM(S)        (S - 1500) / 500 * MAX_PWM_VALUE
 #define     TRANSLATE_REVERSE_PWM(S)        (1500 - S) / 500 * MAX_PWM_VALUE
@@ -60,6 +63,24 @@ volatile uint8_t timer1_compa_matches = 0;
 volatile uint8_t pwm_threshold = 0;
 
 
+// inline methods for controlling h-bridge direction
+static inline void enableForwardGates() {
+    PORTB = HBRIDGE1_START | HBRIDGE1_END;
+}
+
+static inline void enableReverseGates() {
+    PORTB = HBRIDGE2_START | HBRIDGE2_END;
+}
+
+static inline void enableBreakGates() {
+    PORTB = HBRIDGE1_END | HBRIDGE2_END;
+}
+
+static inline void disableAllGates() {
+    PORTB = 0;
+}
+
+
 // **********************************************
 // ***** ISR - interrupt service routine(s) *****
 // **********************************************
@@ -67,24 +88,19 @@ volatile uint8_t pwm_threshold = 0;
 // called when an interrupt enabled pin changes its state
 ISR(PCINT0_vect){
     if (PINB & PWM_INPUT) {
+        timer1_compa_matches = 0;
         timer0_ovf = 0;   // reset timer overflow counter at rising edge pin change interrupt
         TCNT0 = 0;   // initialize counter register at rising edge pin change interrupt
     } else {
-        count = TCNT0;   // use counter register at falling edge pin change interrupt
-        // time between rising and falling edge (pulse width)
-        // count number of timer overflows
-        // multiply them by 256 (if we have an 8-bit counter)
-        // add the timer counts from beginning of last overflow
-        pulses = timer0_ovf * 256 + count;
-  }
+        pulses = timer0_ovf * 27;
+    }
 }
 
-ISR(TIM0_OVF_vect){
+ISR(TIM0_OVF_vect) { 
     timer0_ovf++;   // count timer overflows since reset in rising edge pin change interrupt
 }
 
-ISR(TIMER1_COMPA_vect)
-{
+ISR(TIM0_COMPA_vect) {
     timer1_compa_matches++;
 
     if (timer1_compa_matches > MAX_PWM_VALUE) {
@@ -120,56 +136,36 @@ ISR(TIMER1_COMPA_vect)
     }
 }
 
-
-static inline void enableForwardGates() {
-    PORTB = HBRIDGE1_START | HBRIDGE1_END;
+//initialization  methods
+static inline void enableInterrupts() {
+    GIMSK |= (1 << PCIE);   // generally enable pin change interrupt
+    PCMSK |= (1 << PCINT0);   // enable pin change interrupt on PB0 (pin 5)
+    TIMSK0 |= (1 << TOIE0) ;   // Timer/Counter0 Overflow Interrupt Enable
+    TIMSK0 |= (1 << OCIE0A);    // Enable compare match A interrupts
 }
 
-static inline void enableReverseGates() {
-    PORTB = HBRIDGE2_START | HBRIDGE2_END;
-}
-
-static inline void enableBreakGates() {
-    PORTB = HBRIDGE1_END | HBRIDGE2_END;
-}
-
-static inline void disableAllGates() {
-    PORTB = 0;
-}
-
-static void enableInterrupts() {
-  GIMSK |= (1 << PCIE);   // generally enable pin change interrupt
-  PCMSK |= (1 << PCINT0);   // enable pin change interrupt on PB0 (pin 5)
-  TIMSK0 |= ((1 << TOIE0) | (1 << TOIE1));   // Timer/Counter0 Overflow Interrupt Enable
-}
-
-static void enableOutputs() {
+static inline void enableOutputs() {
     DDRB = HBRIDGE1_START | HBRIDGE1_END | HBRIDGE2_START | HBRIDGE2_END;
     _delay_ms(10);
 }
 
 // this timer is used to measure RC pulse lengths
-static void setupTimer0() {
+static inline void setupTimer0() {
     GTCCR |= (1 << TSM) | (1 << PSR10);   // halt timer
-    TCCR0B |= (1 << CS01);   // set prescaler to 8
+    TCCR0B |= (1 << CS00);   // set prescaler to 1
     TCNT0 = 0;   // initialize timer to 0
+    OCR0A = COMPARE_MATCH_A;   // initialize compare match A value
+    TCCR0A |= (1 << WGM01);
+    MCUCR |= (1 << ISC00);
     GTCCR &= ~(1 << TSM);   // start timer
 }
 
-// this timer is used to emulate a PWM output signal
-static void setupTimer1() {
-    GTCCR |= (1 << TSM) | (1 << PSR10);   // halt timer
-    TCCR1B |= ((1 << CS00) | (1 << CS01));   // et prescaler to 64
-    TCNT1 = 0;   // initialize timer to 0
-    GTCCR &= ~(1 << TSM);   // start timer
-}
-
-static void initialize() {
+static inline void initialize() {
     cli();
     enableInterrupts();
-    setupTimer();
+    setupTimer0();
     enableOutputs();
-    sti();
+    sei();
 }
 
 static void updateForward(uint8_t pwmVal, uint8_t currentState) {
@@ -206,10 +202,16 @@ static uint8_t updateHBridge(uint8_t pwmVal, uint8_t currentState) {
 
 int main(void) {
     initialize();
+    _delay_ms(100);
 
-    uint8_t inputSignalPrev = 0;
-    uint8_t inputSignal = inputSignalPrev;
+    uint16_t inputSignalPrev = 0;
+    uint16_t inputSignal = inputSignalPrev;
     uint8_t motor_direction = BREAK;
+
+    // wait until we actually read a signal so we dont start incorrectly
+    while (inputSignal == inputSignalPrev) {
+        inputSignal = pulses;
+    }
 
     while (TRUE) {
         inputSignal = pulses;
@@ -217,6 +219,6 @@ int main(void) {
         if (inputSignal != inputSignalPrev) {
             motor_direction = updateHBridge(inputSignal, motor_direction);
             inputSignalPrev = inputSignal;        
-        }        
+        }       
     }
 }
